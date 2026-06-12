@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Runtime data (lives in ~/.damso/, never in repo)
+*.log
+*.db
+
+# IDE
+.idea/
+.vscode/
