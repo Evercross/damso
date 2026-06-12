@@ -242,3 +242,6 @@ Claude Code에서 작업 후, Codex에 다음을 검증 요청:
 - Developer ID 서명
 - .app 번들 재구성
 - 자동 업데이트 (Sparkle)
+
+> 📌 2026-06-12 라이트 런칭 로드맵: docs/plans/2026-06-12-damso-deployment-roadmap.md
+> 공개 리포: https://github.com/Evercross/damso (본체는 ~/Projects/damso — Downloads 복사본은 구버전)
