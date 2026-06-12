@@ -12,6 +12,5 @@ if [ ! -d "$SCRIPT_DIR/.venv" ]; then
     exit 1
 fi
 
-source "$SCRIPT_DIR/.venv/bin/activate"
 cd "$SCRIPT_DIR"
-python app.py "$@"
+exec "$SCRIPT_DIR/.venv/bin/python" app.py "$@"
