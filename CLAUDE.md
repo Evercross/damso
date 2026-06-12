@@ -179,15 +179,15 @@ cat << 'EOF' > ~/Library/LaunchAgents/com.damso.app.plist
     <string>com.damso.app</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/Sung_Book/Downloads/mallo_custom/mallo_local/.venv/bin/python</string>
-        <string>/Users/Sung_Book/Downloads/mallo_custom/mallo_local/app.py</string>
+        <string>/Users/Sung_Book/Projects/damso/.venv/bin/python</string>
+        <string>/Users/Sung_Book/Projects/damso/app.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <false/>
     <key>WorkingDirectory</key>
-    <string>/Users/Sung_Book/Downloads/mallo_custom/mallo_local</string>
+    <string>/Users/Sung_Book/Projects/damso</string>
     <key>StandardOutPath</key>
     <string>/tmp/damso-stdout.log</string>
     <key>StandardErrorPath</key>
@@ -203,7 +203,7 @@ launchctl load ~/Library/LaunchAgents/com.damso.app.plist
 ### 방법 2: Alfred 워크플로우
 ```bash
 # Alfred 워크플로우에 다음 스크립트 등록
-cd /Users/Sung_Book/Downloads/mallo_custom/mallo_local && .venv/bin/python app.py &
+cd /Users/Sung_Book/Projects/damso && .venv/bin/python app.py &
 ```
 
 ---

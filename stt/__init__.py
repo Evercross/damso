@@ -1,19 +1,68 @@
 """
-Damso - Speech-to-Text Engine
-Supports: Qwen3-ASR (MLX, default) and Whisper (faster-whisper, fallback)
+Damso - Speech-to-Text Engine (Plugin Architecture)
+
+Public API (unchanged from old stt.py):
+    STTEngine, list_input_devices, get_model_update_info, update_model_cache
 """
-import numpy as np
-import sounddevice as sd
+import importlib
+import logging
+import os
+import pkgutil
 import threading
 import time
-import tempfile
-import os
-import logging
-import soundfile as sf
+
+import numpy as np
+import sounddevice as sd
 
 log = logging.getLogger("damso")
-HF_CACHE_DIR = os.path.expanduser("~/.cache/huggingface/hub")
 
+# ── Backend Registry ─────────────────────────────────────────────────────
+
+REGISTRY: dict[str, type] = {}
+
+
+def register(cls):
+    """Decorator: register an STT backend class by its `name` attribute."""
+    REGISTRY[cls.name] = cls
+    return cls
+
+
+def get_backend_class(engine_name: str):
+    """Look up a registered backend by engine name."""
+    return REGISTRY.get(engine_name)
+
+
+def list_engines() -> list[dict]:
+    """Return list of available engines for settings UI."""
+    engines = []
+    for name, cls in REGISTRY.items():
+        engines.append({
+            "name": name,
+            "display_name": cls.display_name,
+            "default_model": cls.default_model,
+            "config_model_key": cls.config_model_key,
+            "models": cls.models,
+        })
+    return engines
+
+
+# ── Auto-discover backends ───────────────────────────────────────────────
+
+def _discover_backends():
+    """Import all backend_*.py modules in this package."""
+    pkg_dir = os.path.dirname(__file__)
+    for finder, module_name, is_pkg in pkgutil.iter_modules([pkg_dir]):
+        if module_name.startswith("backend_"):
+            try:
+                importlib.import_module(f".{module_name}", package=__name__)
+            except Exception as exc:
+                log.warning(f"[STT] Failed to load backend '{module_name}': {exc}")
+
+
+_discover_backends()
+
+
+# ── Audio Input Device Helpers ───────────────────────────────────────────
 
 def _coerce_device_config(value):
     """Normalize persisted input-device config to 'default' or integer index string."""
@@ -85,17 +134,20 @@ def list_input_devices():
             label = f"{name} ({samplerate}Hz)"
             if default_idx is not None and idx == default_idx:
                 label += " [System Default]"
-            devices.append(
-                {
-                    "id": str(idx),
-                    "name": name,
-                    "label": label,
-                    "is_default": bool(default_idx is not None and idx == default_idx),
-                }
-            )
+            devices.append({
+                "id": str(idx),
+                "name": name,
+                "label": label,
+                "is_default": bool(default_idx is not None and idx == default_idx),
+            })
     except Exception as exc:
         log.warning(f"[STT] Failed to enumerate input devices: {exc}")
     return devices
+
+
+# ── HuggingFace Update Helpers ───────────────────────────────────────────
+
+HF_CACHE_DIR = os.path.expanduser("~/.cache/huggingface/hub")
 
 
 def _is_hf_repo_model(model_name):
@@ -136,12 +188,8 @@ def get_model_update_info(engine, model_name):
         "message": "",
     }
 
-    if engine != "qwen3-asr" and not _is_hf_repo_model(model_name):
-        base["message"] = "현재는 Hugging Face 기반 모델만 업데이트 확인을 지원합니다."
-        return base
-
     if not _is_hf_repo_model(model_name):
-        base["message"] = "모델 형식이 Hugging Face 리포지토리 형식이 아닙니다."
+        base["message"] = "현재는 Hugging Face 기반 모델만 업데이트 확인을 지원합니다."
         return base
 
     base["supported"] = True
@@ -149,7 +197,6 @@ def get_model_update_info(engine, model_name):
 
     try:
         from huggingface_hub import HfApi
-
         latest = HfApi().model_info(model_name, revision="main").sha
     except Exception as exc:
         base["message"] = f"최신 버전 확인 실패: {exc}"
@@ -191,7 +238,6 @@ def update_model_cache(engine, model_name):
 
     try:
         from huggingface_hub import snapshot_download
-
         snapshot_path = snapshot_download(
             repo_id=model_name,
             revision="main",
@@ -218,11 +264,13 @@ def update_model_cache(engine, model_name):
     return result
 
 
+# ── STTEngine (public API — delegates to backend) ────────────────────────
+
 class STTEngine:
     """Local STT engine with pluggable backends.
 
-    Default: Qwen3-ASR via mlx-qwen3-asr (Apple Silicon GPU)
-    Fallback: Whisper via faster-whisper (CPU)
+    Handles audio recording (shared) and delegates transcription to
+    the selected backend.
     """
 
     def __init__(
@@ -244,14 +292,16 @@ class STTEngine:
         self._stream = None
         self._lock = threading.Lock()
 
-        # Engine-specific defaults
-        if engine == "qwen3-asr":
-            self.model_name = model_name or "Qwen/Qwen3-ASR-1.7B"
-        else:
-            self.model_name = model_name or "large-v3"
+        # Resolve backend
+        backend_cls = get_backend_class(engine)
+        if backend_cls is None:
+            available = ", ".join(REGISTRY.keys()) or "(none)"
+            raise ValueError(
+                f"Unknown STT engine '{engine}'. Available: {available}"
+            )
 
-        self._session = None  # Qwen3-ASR session
-        self._whisper_model = None  # Whisper model
+        self.model_name = model_name or backend_cls.default_model
+        self._backend = backend_cls()
 
     @staticmethod
     def _coerce_min_audio_seconds(value):
@@ -276,7 +326,6 @@ class STTEngine:
 
         if value == "default":
             try:
-                # Re-sync PortAudio defaults so system input changes apply immediately.
                 sd.default.reset()
             except Exception:
                 pass
@@ -304,28 +353,7 @@ class STTEngine:
 
     def load_model(self):
         """Load the STT model. Call once at startup."""
-        if self.engine == "qwen3-asr":
-            self._load_qwen()
-        else:
-            self._load_whisper()
-
-    def _load_qwen(self):
-        """Load Qwen3-ASR model via mlx-qwen3-asr Session API."""
-        log.info(f"[STT] Loading Qwen3-ASR model: {self.model_name}...")
-        from mlx_qwen3_asr import Session
-        self._session = Session(model=self.model_name)
-        log.info("[STT] Qwen3-ASR model loaded successfully.")
-
-    def _load_whisper(self):
-        """Load Whisper model via faster-whisper (CPU fallback)."""
-        log.info(f"[STT] Loading Whisper model: {self.model_name}...")
-        from faster_whisper import WhisperModel
-        self._whisper_model = WhisperModel(
-            self.model_name,
-            device="cpu",
-            compute_type="int8",
-        )
-        log.info("[STT] Whisper model loaded successfully.")
+        self._backend.load_model(self.model_name)
 
     def start_recording(self):
         """Start capturing audio from microphone."""
@@ -356,7 +384,6 @@ class STTEngine:
             self._stream.start()
             log.info(f"[STT] Recording started... (input={device_label})")
         except Exception as exc:
-            # Fallback once to system default when explicit device failed.
             if device_idx is not None:
                 log.warning(
                     f"[STT] Failed to open input device {device_label}: {exc}. "
@@ -384,8 +411,14 @@ class STTEngine:
             self.is_recording = False
 
         if self._stream:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                # Brief pause before close to let the audio hardware drain
+                # its buffer — prevents the pop/click artifact on USB devices.
+                time.sleep(0.05)
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
 
         if not self.audio_buffer:
@@ -405,7 +438,6 @@ class STTEngine:
         min_sec = self._coerce_min_audio_seconds(self.min_audio_seconds)
         self.min_audio_seconds = min_sec
 
-        # Minimum audio length check
         if duration_sec < min_sec:
             log.info(
                 f"[STT] Audio too short ({duration_sec:.2f}s < {min_sec:.2f}s), skipping."
@@ -415,51 +447,11 @@ class STTEngine:
         log.info("[STT] Transcribing...")
         start_time = time.time()
 
-        if self.engine == "qwen3-asr":
-            result = self._transcribe_qwen(audio_data)
-        else:
-            result = self._transcribe_whisper(audio_data)
+        result = self._backend.transcribe(audio_data, self.language, self.sample_rate)
 
         elapsed = time.time() - start_time
         log.info(f"[STT] Transcription done in {elapsed:.2f}s")
         return result
-
-    def _transcribe_qwen(self, audio_data):
-        """Transcribe using Qwen3-ASR."""
-        if self._session is None:
-            raise RuntimeError("Qwen3-ASR model not loaded. Call load_model() first.")
-
-        # Save audio to temp WAV file (mlx-qwen3-asr expects file path or array)
-        tmp_path = None
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-            os.close(tmp_fd)
-            sf.write(tmp_path, audio_data, self.sample_rate)
-
-            result = self._session.transcribe(tmp_path, language=self.language)
-            return result.text.strip() if result.text else ""
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    def _transcribe_whisper(self, audio_data):
-        """Transcribe using faster-whisper (fallback)."""
-        if self._whisper_model is None:
-            raise RuntimeError("Whisper model not loaded. Call load_model() first.")
-
-        segments, info = self._whisper_model.transcribe(
-            audio_data,
-            language=self.language,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-        )
-
-        text_parts = []
-        for segment in segments:
-            text_parts.append(segment.text.strip())
-
-        return " ".join(text_parts).strip()
 
     def record_and_transcribe(self):
         """Convenience: stop recording and immediately transcribe."""

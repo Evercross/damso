@@ -62,7 +62,7 @@ class TextInserter:
             return False
 
         method = (self.method or "stable").strip().lower()
-        if method not in {"stable", "auto", "cgevent", "applescript"}:
+        if method not in {"stable", "auto", "cgevent", "applescript", "ax"}:
             method = "stable"
 
         app_info = self.get_active_app_info()
@@ -90,7 +90,12 @@ class TextInserter:
         names = []
         typing_first = self._is_typing_first_app(app_name, bundle_id)
 
-        if method == "applescript":
+        if method == "ax":
+            # AX-first: direct text set via Accessibility API bypasses clipboard
+            # and keyboard events entirely. Falls back to cgevent chain if the
+            # focused element doesn't support text injection.
+            names = ["ax", "cgevent", "applescript", "unicode"]
+        elif method == "applescript":
             names = ["applescript", "cgevent", "unicode"]
         elif method == "stable":
             # Stable mode keeps paste-first and includes AppleScript fallback.
@@ -139,7 +144,9 @@ class TextInserter:
                     log.info("[Inserter] Strategy 'applescript' skipped (Automation explicitly denied, code=1002)")
                     continue
             try:
-                if name == "unicode":
+                if name == "ax":
+                    ok = self._insert_via_ax(text)
+                elif name == "unicode":
                     ok = self._insert_via_unicode_typing(text)
                 elif name == "cgevent":
                     ok = self._insert_via_cgevent(text, app_name, bundle_id)
@@ -160,25 +167,47 @@ class TextInserter:
 
     @staticmethod
     def _read_clipboard_bytes():
+        """Read clipboard via NSPasteboard (no subprocess fork)."""
         try:
-            result = subprocess.run(
-                ["pbpaste"],
-                capture_output=True,
-                timeout=3,
-                check=False,
-            )
-            return result.stdout
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            pb = NSPasteboard.generalPasteboard()
+            s = pb.stringForType_(NSPasteboardTypeString)
+            if s is not None:
+                return s.encode("utf-8")
+            # Fallback: raw data for non-string content.
+            data = pb.dataForType_(NSPasteboardTypeString)
+            return bytes(data) if data else b""
         except Exception:
-            return b""
+            # Fallback to pbpaste subprocess.
+            try:
+                result = subprocess.run(
+                    ["pbpaste"], capture_output=True, timeout=3, check=False,
+                )
+                return result.stdout
+            except Exception:
+                return b""
 
     @staticmethod
     def _write_clipboard_bytes(payload):
+        """Write clipboard via NSPasteboard (no subprocess fork)."""
         try:
-            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-            proc.communicate(payload, timeout=3)
-            return proc.returncode == 0
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            from Foundation import NSString, NSUTF8StringEncoding
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            text = NSString.alloc().initWithData_encoding_(payload, NSUTF8StringEncoding)
+            if text is None:
+                text = payload.decode("utf-8", errors="replace")
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            return True
         except Exception:
-            return False
+            # Fallback to pbcopy subprocess.
+            try:
+                proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                proc.communicate(payload, timeout=3)
+                return proc.returncode == 0
+            except Exception:
+                return False
 
     def _clipboard_restore_delay(self, app_name, bundle_id):
         bundle_id = (bundle_id or "").lower()
@@ -191,22 +220,95 @@ class TextInserter:
         return 0.25
 
     def _with_temp_clipboard(self, text, paste_fn, app_name="", bundle_id=""):
+        log.info("[Inserter] step:clipboard_read_start")
         original = self._read_clipboard_bytes()
+        log.info("[Inserter] step:clipboard_read_done")
         try:
+            log.info("[Inserter] step:clipboard_write_start")
             if not self._write_clipboard_bytes(text.encode("utf-8")):
-                log.warning("[Inserter] Failed to write text to clipboard via pbcopy.")
+                log.warning("[Inserter] Failed to write text to clipboard.")
                 return False
+            log.info("[Inserter] step:clipboard_write_done")
             time.sleep(0.08)
-            return bool(paste_fn())
+            log.info("[Inserter] step:paste_start")
+            result = bool(paste_fn())
+            log.info("[Inserter] step:paste_done")
+            return result
         finally:
             # Restore clipboard after insertion attempt.
-            time.sleep(self._clipboard_restore_delay(app_name, bundle_id))
+            delay = self._clipboard_restore_delay(app_name, bundle_id)
+            log.info("[Inserter] step:clipboard_restore_wait (%.2fs)", delay)
+            time.sleep(delay)
+            log.info("[Inserter] step:clipboard_restore_start")
             if not self._write_clipboard_bytes(original):
                 log.warning("[Inserter] Failed to restore original clipboard contents.")
+            log.info("[Inserter] step:clipboard_restore_done")
 
     @staticmethod
     def _has_accessibility_permission():
         return is_accessibility_trusted()
+
+    def _insert_via_ax(self, text):
+        """Insert text by directly setting kAXSelectedText on the focused UI element.
+
+        Avoids clipboard writes and keyboard event posts entirely, which
+        sidesteps the macOS-26 system-beep-on-simulated-paste behavior.
+        Returns False if Accessibility is missing or the focused element
+        doesn't support text injection — the run_strategy loop will fall
+        back to the next method.
+        """
+        if not self._has_accessibility_permission():
+            log.warning("[Inserter] Accessibility permission missing. AX insert skipped.")
+            return False
+
+        try:
+            from ApplicationServices import (
+                AXUIElementCreateSystemWide,
+                AXUIElementCopyAttributeValue,
+                AXUIElementSetAttributeValue,
+            )
+        except Exception as exc:
+            log.warning(f"[Inserter] AX framework unavailable: {exc}")
+            return False
+
+        try:
+            system_wide = AXUIElementCreateSystemWide()
+            # Locate focused UI element
+            err, focused = AXUIElementCopyAttributeValue(
+                system_wide, "AXFocusedUIElement", None
+            )
+            if err != 0 or focused is None:
+                log.info(f"[Inserter] AX: no focused element (err={err})")
+                return False
+
+            # Prefer replacing the current selection so we insert at cursor
+            # without clobbering existing content.
+            set_err = AXUIElementSetAttributeValue(
+                focused, "AXSelectedText", text
+            )
+            if set_err == 0:
+                return True
+
+            log.info(
+                f"[Inserter] AX: AXSelectedText set failed (err={set_err}); trying AXValue append"
+            )
+
+            # Fallback: read AXValue, append text, write back. This only works
+            # for controls that expose the full value as a writable string,
+            # and it moves the cursor to the end — not ideal, so we only do
+            # this if setting selected text was rejected.
+            err2, current = AXUIElementCopyAttributeValue(focused, "AXValue", None)
+            if err2 == 0 and isinstance(current, str):
+                new_val = current + text
+                set_err2 = AXUIElementSetAttributeValue(focused, "AXValue", new_val)
+                if set_err2 == 0:
+                    return True
+                log.info(f"[Inserter] AX: AXValue write failed (err={set_err2})")
+
+            return False
+        except Exception as exc:
+            log.warning(f"[Inserter] AX insert crashed: {exc}")
+            return False
 
     def _insert_via_cgevent(self, text, app_name="", bundle_id=""):
         """Insert text using pbcopy + Quartz CGEvent Cmd+V."""
@@ -217,7 +319,9 @@ class TextInserter:
             return False
 
         def _paste():
+            log.info("[Inserter] step:modifiers_wait_start")
             self._wait_for_modifiers_release()
+            log.info("[Inserter] step:modifiers_wait_done")
 
             # Build Cmd+V as "V key event with Command flag" so input source
             # (Korean/English IME) does not reinterpret it as literal typing.
@@ -245,9 +349,14 @@ class TextInserter:
             Quartz.CGEventSetFlags(v_down, Quartz.kCGEventFlagMaskCommand)
             Quartz.CGEventSetFlags(v_up, Quartz.kCGEventFlagMaskCommand)
 
+            log.info("[Inserter] step:cgevent_post_start")
             for evt in events:
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+                # Post at the annotated-session tap so HID-level hooks
+                # (Keyboard Maestro, BetterTouchTool) don't see simulated
+                # Cmd+V and trigger their own feedback sounds.
+                Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, evt)
                 time.sleep(0.01)
+            log.info("[Inserter] step:cgevent_post_done")
 
             time.sleep(0.08)
             return True
@@ -312,8 +421,8 @@ class TextInserter:
 
                 Quartz.CGEventKeyboardSetUnicodeString(down, len(ch), ch)
                 Quartz.CGEventKeyboardSetUnicodeString(up, len(ch), ch)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+                Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, down)
+                Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, up)
                 time.sleep(0.003)
             return True
         except Exception as exc:

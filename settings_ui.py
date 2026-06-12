@@ -10,6 +10,7 @@ import webview
 from config import load_config, save_config, load_dictionary, save_dictionary
 from stt import (
     list_input_devices,
+    list_engines as stt_list_engines,
     get_model_update_info as stt_get_model_update_info,
     update_model_cache as stt_update_model_cache,
 )
@@ -45,6 +46,9 @@ class SettingsAPI:
 
     def get_audio_input_devices(self):
         return json.dumps(list_input_devices(), ensure_ascii=False)
+
+    def get_engines(self):
+        return json.dumps(stt_list_engines(), ensure_ascii=False)
 
     def get_model_update_info(self, engine, model_name):
         result = stt_get_model_update_info(engine, model_name)
@@ -435,8 +439,7 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
                     <div class="card-row-desc">Speech recognition backend</div>
                 </div>
                 <select id="cfg-engine" onchange="onEngineChange()">
-                    <option value="qwen3-asr">Qwen3-ASR (MLX GPU) — Fast</option>
-                    <option value="whisper">Whisper (CPU) — Legacy</option>
+                    <!-- Populated dynamically from backend registry -->
                 </select>
             </div>
             <div class="card-row">
@@ -648,21 +651,41 @@ function toggleSwitch(el, key) {
     config[key] = el.classList.contains('on');
 }
 
+// ── Engine Registry (loaded from Python backend) ──
+let engineRegistry = [];
+
+async function loadEngineRegistry() {
+    try {
+        const raw = await pywebview.api.get_engines();
+        engineRegistry = JSON.parse(raw);
+    } catch (e) {
+        console.warn('Failed to load engine registry:', e);
+        engineRegistry = [];
+    }
+}
+
+function populateEngineSelect(selectedEngine) {
+    const engineSelect = document.getElementById('cfg-engine');
+    engineSelect.innerHTML = '';
+    for (const eng of engineRegistry) {
+        engineSelect.add(new Option(eng.display_name, eng.name));
+    }
+    if (selectedEngine) {
+        engineSelect.value = selectedEngine;
+    }
+}
+
 // ── Load Config ──
 function onEngineChange() {
     const engine = document.getElementById('cfg-engine').value;
     const modelSelect = document.getElementById('cfg-model');
     modelSelect.innerHTML = '';
 
-    if (engine === 'qwen3-asr') {
-        modelSelect.add(new Option('Qwen3-ASR-1.7B — Best quality', 'Qwen/Qwen3-ASR-1.7B'));
-        modelSelect.add(new Option('Qwen3-ASR-0.6B — Lighter', 'Qwen/Qwen3-ASR-0.6B'));
-    } else {
-        modelSelect.add(new Option('Tiny — Fastest', 'tiny'));
-        modelSelect.add(new Option('Base — Fast', 'base'));
-        modelSelect.add(new Option('Small — Balanced', 'small'));
-        modelSelect.add(new Option('Medium — Accurate', 'medium'));
-        modelSelect.add(new Option('Large V3 — Best quality', 'large-v3'));
+    const entry = engineRegistry.find(e => e.name === engine);
+    if (entry && entry.models) {
+        for (const m of entry.models) {
+            modelSelect.add(new Option(m.label, m.id));
+        }
     }
 
     if (modelSelect.options.length > 0) {
@@ -774,12 +797,15 @@ async function loadAudioInputDevices(selectedValue) {
 }
 
 async function loadConfig() {
+    await loadEngineRegistry();
     const raw = await pywebview.api.get_config();
     config = JSON.parse(raw);
-    document.getElementById('cfg-engine').value = config.stt_engine || 'qwen3-asr';
+    populateEngineSelect(config.stt_engine || 'qwen3-asr');
     onEngineChange();
-    // Set model value after populating options
-    const modelKey = config.stt_engine === 'whisper' ? 'whisper_model' : 'qwen_model';
+    // Set model value after populating options — use config_model_key from registry
+    const engineName = config.stt_engine || 'qwen3-asr';
+    const entry = engineRegistry.find(e => e.name === engineName);
+    const modelKey = entry ? entry.config_model_key : 'qwen_model';
     document.getElementById('cfg-model').value = config[modelKey] || '';
     document.getElementById('cfg-language').value = config.language || 'ko';
     document.getElementById('cfg-hold-key').value = config.hotkey_hold || 'right_option';
@@ -818,11 +844,9 @@ function setSelectClosestNumber(id, value) {
 async function saveSettings() {
     config.stt_engine = document.getElementById('cfg-engine').value;
     const modelVal = document.getElementById('cfg-model').value;
-    if (config.stt_engine === 'whisper') {
-        config.whisper_model = modelVal;
-    } else {
-        config.qwen_model = modelVal;
-    }
+    const entry = engineRegistry.find(e => e.name === config.stt_engine);
+    const modelKey = entry ? entry.config_model_key : 'qwen_model';
+    config[modelKey] = modelVal;
     config.language = document.getElementById('cfg-language').value;
     config.hotkey_hold = document.getElementById('cfg-hold-key').value;
     config.insert_method = document.getElementById('cfg-insert-method').value;

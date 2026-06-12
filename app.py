@@ -139,7 +139,7 @@ if not SETTINGS_MODE:
     except Exception:
         pass
 
-from stt import STTEngine, update_model_cache
+from stt import STTEngine, update_model_cache, get_backend_class
 from dictionary import Dictionary
 from history import HistoryManager
 from text_inserter import TextInserter
@@ -175,12 +175,12 @@ class DamsoApp(rumps.App):
         self.config = load_config()
 
         # Initialize components
+        engine_name = self.config.get("stt_engine", "qwen3-asr")
+        backend_cls = get_backend_class(engine_name)
+        model_key = backend_cls.config_model_key if backend_cls else "qwen_model"
         self.stt = STTEngine(
-            engine=self.config.get("stt_engine", "qwen3-asr"),
-            model_name=(
-                self.config.get("qwen_model") if self.config.get("stt_engine") == "qwen3-asr"
-                else self.config.get("whisper_model")
-            ),
+            engine=engine_name,
+            model_name=self.config.get(model_key),
             language=self.config["language"],
             sample_rate=self.config["sample_rate"],
             min_audio_seconds=self.config.get("min_audio_seconds", 0.30),
@@ -252,14 +252,19 @@ class DamsoApp(rumps.App):
         """Build settings submenu."""
         settings = rumps.MenuItem("⚙️ 설정")
 
-        # Model size
+        # Model size — dynamically populated from backend registry
         model_menu = rumps.MenuItem("모델 크기")
-        for size in ["tiny", "base", "small", "medium", "large-v3"]:
-            item = rumps.MenuItem(
-                f"{'✓ ' if size == self.config['whisper_model'] else '  '}{size}",
-                callback=lambda sender, s=size: self.on_change_model(s),
-            )
-            model_menu.add(item)
+        engine_name = self.config.get("stt_engine", "qwen3-asr")
+        bcls = get_backend_class(engine_name)
+        if bcls:
+            mkey = bcls.config_model_key
+            current_model = self.config.get(mkey, bcls.default_model)
+            for m in bcls.models:
+                item = rumps.MenuItem(
+                    f"{'✓ ' if m['id'] == current_model else '  '}{m['label']}",
+                    callback=lambda sender, s=m['id']: self.on_change_model(s),
+                )
+                model_menu.add(item)
         settings.add(model_menu)
 
         # Language
@@ -312,14 +317,6 @@ class DamsoApp(rumps.App):
                     self.menu["모델 로딩 중..."].title = "준비 완료"
             except Exception:
                 pass
-            try:
-                engine = self.config.get("stt_engine", "qwen3-asr")
-                model_label = self.config.get("qwen_model") if engine == "qwen3-asr" else self.config.get("whisper_model")
-                rumps.notification(
-                    "Damso",
-                    "준비 완료",
-                    f"모델({model_label}) 로드 완료",
-                )
             except Exception:
                 pass
 
@@ -345,15 +342,7 @@ class DamsoApp(rumps.App):
                             "ok" if automation_ok else "blocked",
                         )
 
-                        now = time.time()
-                        if (now - self._last_permission_notice_ts) > 12:
-                            self._last_permission_notice_ts = now
-                            if not trusted:
-                                rumps.notification(
-                                    "Damso",
-                                    "손쉬운 사용 권한 필요",
-                                    "메뉴의 '권한 점검'에서 상태 확인 후 허용해주세요.",
-                                )
+                        # Log-only: no notification sound for permission changes.
 
                     # Re-attempt hotkey listener whenever Accessibility is granted,
                     # even if a previous listener thread already exited (it resets the
@@ -704,8 +693,7 @@ class DamsoApp(rumps.App):
         log.info(f"[App] _start_dictation called (model_loaded={self.is_model_loaded}, is_dictating={self.is_dictating})")
 
         if not self.is_model_loaded:
-            log.info("[App] ❌ Model not loaded yet!")
-            rumps.notification("Damso", "대기 중", "모델을 아직 로딩 중입니다...")
+            log.info("[App] Model not loaded yet — ignoring dictation request.")
             return
 
         if self.is_dictating:
@@ -751,13 +739,7 @@ class DamsoApp(rumps.App):
                 if not raw_text:
                     log.info("[App] ⚠️ No text transcribed (empty result)")
                     now = time.time()
-                    if (now - self._last_empty_notice_ts) > 8:
-                        self._last_empty_notice_ts = now
-                        rumps.notification(
-                            "Damso",
-                            "인식 결과 없음",
-                            "말한 길이가 짧거나 입력이 잡히지 않았어요. 1초 이상 눌러서 다시 시도해 주세요.",
-                        )
+                    pass  # Log-only, no notification for empty results.
                     self.title = None if self.icon else "Damso"
                     return
 
@@ -817,12 +799,14 @@ class DamsoApp(rumps.App):
                                 "Damso",
                                 "손쉬운 사용 권한 필요",
                                 "메뉴의 '권한 점검'에서 상태를 확인하고 손쉬운 사용을 허용해주세요.",
+                                sound=False,
                             )
                         elif not system_events_ok:
                             rumps.notification(
                                 "Damso",
                                 "자동화 권한 필요",
                                 "시스템 설정 > 개인정보 보호 및 보안 > 자동화에서 Damso 허용을 확인해주세요.",
+                                sound=False,
                             )
 
                 # Save to history
@@ -834,23 +818,14 @@ class DamsoApp(rumps.App):
                     app_name=app_name,
                 )
 
-                # Show notification if enabled
-                if self.config["show_notification"]:
-                    if inserted:
-                        display_text = processed_text[:50] + "..." if len(processed_text) > 50 else processed_text
-                        rumps.notification("Damso", f"입력 완료 → {app_name}", display_text)
-                    else:
-                        rumps.notification(
-                            "Damso",
-                            "삽입 실패",
-                            "손쉬운 사용 권한과 입력 커서 위치, Insert method(stable/cgevent)를 확인해주세요.",
-                        )
+                # Only notify on errors — success is silent.
+                pass
 
             except Exception as e:
                 log.info(f"[App] ❌ Error during transcription: {e}")
                 import traceback
                 traceback.print_exc()
-                rumps.notification("Damso", "오류", str(e))
+                rumps.notification("Damso", "오류", str(e), sound=False)
             finally:
                 self.title = None if self.icon else "Damso"
 
@@ -877,7 +852,7 @@ class DamsoApp(rumps.App):
         )
 
         if trusted and automation_ok:
-            rumps.notification("Damso", "권한 상태 정상", "손쉬운 사용/자동화 권한이 모두 확인되었습니다.")
+            log.info("[Permission] manual check: all permissions OK.")
             return
 
         # Trigger one explicit native prompt only when user asked for a check.
@@ -890,11 +865,7 @@ class DamsoApp(rumps.App):
         if not automation_ok:
             open_automation_settings()
 
-        rumps.notification(
-            "Damso",
-            "권한 확인 필요",
-            "시스템 설정에서 Damso의 손쉬운 사용/자동화 권한을 허용한 뒤 다시 테스트해주세요.",
-        )
+        log.info("[Permission] Opened System Settings for user to grant missing permissions.")
 
     def on_open_settings_ui(self, sender):
         """Open the settings UI as a separate process (pywebview needs main thread)."""
@@ -958,7 +929,7 @@ class DamsoApp(rumps.App):
     def on_generate_diagnostics(self, sender):
         """Generate a local diagnostics report for reproducible troubleshooting."""
         self._refresh_runtime_config()
-        rumps.notification("Damso", "진단 리포트", "상태 점검 리포트를 생성 중입니다...")
+        log.info("[App] Generating diagnostics report...")
 
         def run():
             try:
@@ -967,14 +938,10 @@ class DamsoApp(rumps.App):
                     log_file=LOG_FILE,
                     log_tail_lines=180,
                 )
-                rumps.notification(
-                    "Damso",
-                    "진단 리포트 완료",
-                    result.get("path", "~/.damso/diagnostics"),
-                )
+                log.info("[App] Diagnostics report saved: %s", result.get("path"))
             except Exception as exc:
                 log.warning(f"[App] Diagnostics report failed: {exc}")
-                rumps.notification("Damso", "진단 리포트 실패", str(exc))
+                rumps.notification("Damso", "진단 리포트 실패", str(exc), sound=False)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -999,8 +966,7 @@ class DamsoApp(rumps.App):
 
             inserted = self.inserter.insert(test_text)
             if inserted:
-                log.info("[Test] ✅ 텍스트 삽입 완료!")
-                rumps.notification("Damso", "테스트 완료", f"'{test_text}' → {app_name}")
+                log.info("[Test] Text insertion OK → %s", app_name)
             else:
                 perm = self.inserter.get_permission_diagnostics()
                 log.warning(
@@ -1013,6 +979,7 @@ class DamsoApp(rumps.App):
                     "Damso",
                     "테스트 실패",
                     "메뉴의 '권한 점검' 실행 후 Insert method(stable/cgevent)로 다시 테스트해주세요.",
+                    sound=False,
                 )
 
         thread = threading.Thread(target=do_test, daemon=True)
@@ -1022,53 +989,30 @@ class DamsoApp(rumps.App):
         """Check/download the latest model revision for the current engine model."""
         self._refresh_runtime_config()
         engine = self.config.get("stt_engine", "qwen3-asr")
-        model_name = (
-            self.config.get("qwen_model")
-            if engine == "qwen3-asr"
-            else self.config.get("whisper_model")
-        )
+        bcls = get_backend_class(engine)
+        mkey = bcls.config_model_key if bcls else "qwen_model"
+        model_name = self.config.get(mkey)
 
-        rumps.notification(
-            "Damso",
-            "모델 업데이트",
-            f"최신 모델을 확인 중입니다: {model_name}",
-        )
+        log.info("[App] Checking model update: %s", model_name)
 
         def run():
             try:
                 result = update_model_cache(engine, model_name)
                 if not result.get("supported"):
-                    rumps.notification(
-                        "Damso",
-                        "모델 업데이트 미지원",
-                        result.get("message", "현재 모델 형식은 자동 업데이트를 지원하지 않습니다."),
-                    )
+                    log.info("[App] Model update not supported: %s", result.get("message"))
                     return
                 if not result.get("ok"):
-                    rumps.notification(
-                        "Damso",
-                        "모델 업데이트 실패",
-                        result.get("message", "모델 업데이트 중 오류가 발생했습니다."),
-                    )
+                    log.warning("[App] Model update failed: %s", result.get("message"))
                     return
 
                 latest = str(result.get("latest_revision") or "")
                 short_latest = latest[:8] if latest else "unknown"
                 if result.get("updated"):
-                    rumps.notification(
-                        "Damso",
-                        "모델 업데이트 완료",
-                        f"{model_name} ({short_latest})\n앱 재시작 후 반영됩니다.",
-                    )
+                    log.info("[App] Model updated to %s — restart to apply.", short_latest)
                 else:
-                    rumps.notification(
-                        "Damso",
-                        "모델 최신 상태",
-                        result.get("message", "이미 최신 리비전입니다."),
-                    )
+                    log.info("[App] Model already at latest revision.")
             except Exception as exc:
-                log.warning(f"[App] Model update failed: {exc}")
-                rumps.notification("Damso", "모델 업데이트 실패", str(exc))
+                log.warning("[App] Model update error: %s", exc)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1115,7 +1059,7 @@ class DamsoApp(rumps.App):
                 if len(parts) == 2:
                     src, tgt = parts[0].strip(), parts[1].strip()
                     self.dictionary.add_user_term(src, tgt)
-                    rumps.notification("Damso", "용어 추가됨", f"{src} → {tgt}")
+                    log.info("[Dictionary] Added: %s → %s", src, tgt)
 
     def on_open_history(self, sender):
         """Show recent history."""
@@ -1144,33 +1088,27 @@ class DamsoApp(rumps.App):
             confirm = rumps.alert("확인", "모든 히스토리를 삭제할까요?", ok="삭제", cancel="취소")
             if confirm == 1:
                 self.history.clear_all()
-                rumps.notification("Damso", "완료", "히스토리가 삭제되었습니다.")
 
     def on_change_model(self, model_size):
         """Change STT model."""
         engine = self.config.get("stt_engine", "qwen3-asr")
-        if engine == "whisper":
-            if model_size == self.config["whisper_model"]:
-                return
-            self.config["whisper_model"] = model_size
-        else:
-            if model_size == self.config["qwen_model"]:
-                return
-            self.config["qwen_model"] = model_size
+        bcls = get_backend_class(engine)
+        mkey = bcls.config_model_key if bcls else "qwen_model"
+        if model_size == self.config.get(mkey):
+            return
+        self.config[mkey] = model_size
         save_config(self.config)
         self.stt.model_name = model_size
         self.is_model_loaded = False
         self.title = "Damso"
         self._load_model_async()
-        rumps.notification("Damso", "모델 변경", f"{model_size} 모델을 로딩합니다...")
 
     def on_change_language(self, lang_code):
         """Change recognition language."""
         self.config["language"] = lang_code
         save_config(self.config)
         self.stt.language = lang_code
-        lang_name = {"ko": "한국어", "en": "English", "ja": "日本語", None: "자동 감지"}.get(lang_code, lang_code)
-        rumps.notification("Damso", "언어 변경", lang_name)
+        log.info("[App] Language changed to: %s", lang_code)
 
     def on_change_retention(self, days):
         """Change history retention period."""
@@ -1178,10 +1116,7 @@ class DamsoApp(rumps.App):
         save_config(self.config)
         self.history.retention_days = days
         deleted = self.history.cleanup_old()
-        if days <= 0:
-            rumps.notification("Damso", "보관 기간 변경", "무기한 보관")
-        else:
-            rumps.notification("Damso", "보관 기간 변경", f"{days}일 (정리 {deleted}건)")
+        log.info("[App] Retention changed to %s days (cleaned %d entries).", days, deleted)
 
     def on_quit(self, sender):
         """Clean quit."""
